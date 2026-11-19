@@ -1627,6 +1627,7 @@ jobs:
       
       - name: Mark commit as built
         if: success()
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.ACTION_MANAGE_TOKEN }}
         run: |
