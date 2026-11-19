@@ -1,4 +1,6 @@
 name: Build GT5 Kernels
+permissions:
+  contents: write
 on:
   workflow_dispatch:
     inputs:
@@ -31,13 +33,13 @@ on:
           - N/A
       KPM:
         type: choice
-        description: "内核模块实现方式//Kernel module implementation method"
+        description: "内核模块实现方式//Kernel module implementation method (BakaSU 请保持 N/A)"
         required: true
-        default: KPM
+        default: N/A
         options:
+          - N/A
           - KPM
           - KPN
-          - N/A
       SUSFS_META:
         type: string
         description: "回退SUSFS(输入哈希或次数或-1关闭)//Rollback SUSFS (Enter commit hash, count, or -1 to disable)"
@@ -305,6 +307,9 @@ jobs:
             echo "::warning title=SUSFS Not Required::当前管理器已自带附加模块，无需启用 SUSFS 模块，强制启用可能导致不开机。"
           fi
           echo "Selected KPM: ${{ github.event.inputs.KPM }}"
+          if [ "${{ github.event.inputs.KPM }}" != "N/A" ]; then
+            echo "::warning title=KPM/KPN Not Supported by BakaSU::BakaSU 已移除 KPM 支持且会检测 KP/KPN 冲突，建议将 KPM 保持为 N/A。"
+          fi
           echo "Custom SUSFS_META: ${{ github.event.inputs.SUSFS_META }}"
           echo "Custom KSU_META: ${{ github.event.inputs.KSU_META }}"
           echo "Selected ZRAM: ${{ github.event.inputs.ZRAM }}"
@@ -1013,11 +1018,10 @@ jobs:
             set_config "CONFIG_KSU_FULL_NAME_FORMAT=\"%TAG_NAME%-${KSU_CUSTOM_TAG}@${KSU_BUILTIN_BRANCH}[%COMMIT_SHA%]\""
           fi
 
-          # KPM配置
-          if [ "${{ github.event.inputs.KPM }}" = "KPM" ] || [ "${{ github.event.inputs.KPM }}" = "N/A" ]; then
+          # KPM配置 (BakaSU 已移除 KPM，仅显式选择 KPM 时保留开关)
+          if [ "${{ github.event.inputs.KPM }}" = "KPM" ]; then
             set_config "CONFIG_KPM=y"
-          fi
-          if [ "${{ github.event.inputs.KPM }}" = "KPN" ]; then
+          else
             set_config "CONFIG_KPM=n"
           fi
 
@@ -1434,8 +1438,8 @@ jobs:
       - name: Apply KPX and Replace Image
         if: ${{ github.event.inputs.KPM != 'N/A' }}
         run: |
-          KPM_DIR="${GITHUB_WORKSPACE}/kernel_workspace/SukiSU_patch/kpm"
-          # KPM_DIR="${GITHUB_WORKSPACE}/kernel_workspace/Action-Build/patches/kpm"
+          # 注意：上游 SukiSU_patch/kpm/patch_linux 已损坏(内嵌空 kpimg 导致 9008)，改用仓库内置 patches/kpm
+          KPM_DIR="${GITHUB_WORKSPACE}/kernel_workspace/Action-Build/patches/kpm"
           KPN_DIR="${GITHUB_WORKSPACE}/kernel_workspace/Action-Build/patches/kpn"
           OUT_DIR="${GITHUB_WORKSPACE}/kernel_workspace/kernel_platform/out/Final-Image-Find"
           cd "${OUT_DIR}"
@@ -1450,6 +1454,38 @@ jobs:
           fi
           mv -f oImage Image
           cp Image "${GITHUB_WORKSPACE}/AnyKernel3/Image"
+
+      - name: Verify AnyKernel3 Image
+        env:
+          KPM_MODE: ${{ github.event.inputs.KPM }}
+        run: |
+          python3 - <<'PY'
+          import os, struct, sys
+
+          img_path = "AnyKernel3/Image"
+          kpm_mode = os.environ.get("KPM_MODE", "N/A")
+          sz = os.path.getsize(img_path)
+          with open(img_path, "rb") as f:
+              data = f.read()
+          if len(data) < 64 or data[0x38:0x3c] != b"ARMd":
+              print(f"❌ 无效的 ARM64 内核 Image 头 (size={sz})", file=sys.stderr)
+              sys.exit(1)
+
+          code0, code1, _, img_size = struct.unpack("<IIQQ", data[:24])
+          if (code1 >> 26) == 0x05:
+              imm26 = code1 & 0x03ffffff
+              if imm26 & 0x02000000:
+                  imm26 -= 0x04000000
+              target = 4 + imm26 * 4
+              print(f"Image size={sz} ({hex(sz)}), image_size={hex(img_size)}, code1 branch target={hex(target)}")
+              if not (0 < target < sz):
+                  print(f"❌ 严重错误：code1 ({hex(code1)}) 跳转目标 {hex(target)} 超出 Image 范围 {hex(sz)}，刷入将导致 9008！", file=sys.stderr)
+                  sys.exit(1)
+              if kpm_mode != "N/A" and data[target - 0x1000 : target - 0x1000 + 2] != b"KP":
+                  print(f"❌ 严重错误：KPX 修补未写入有效 kpimg 头（位于 {hex(target - 0x1000)}），终止构建以防 9008！", file=sys.stderr)
+                  sys.exit(1)
+          print("✅ AnyKernel3/Image 头部及跳转校验通过")
+          PY
 
       - name: Download Latest SUSFS Module from CI
         if: ${{ github.event.inputs.SUSFS_CI == 'CI' && github.event.inputs.SUSFS_META != '-1' }}
